@@ -1,56 +1,107 @@
-// PDF load karne ka index.js file
+// index.js
+import express from 'express';
 import * as dotenv from 'dotenv';
 dotenv.config();
 
-import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf';
-import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { GoogleGenerativeAIEmbeddings } from '@langchain/google-genai';
 import { Pinecone } from '@pinecone-database/pinecone';
-import { PineconeStore } from '@langchain/pinecone';
+import { GoogleGenAI } from "@google/genai";
 
+const app = express();
+app.use(express.json());
 
-async function indexDocument() {
-    
-const PDF_PATH = './Arogya Sanjeevani Policy - CIN - U10200WB1906GOI001713 1.pdf';
-const pdfLoader = new PDFLoader(PDF_PATH);
-const rawDocs = await pdfLoader.load();
-console.log("PDF loaded");
-// Chunking karo
+const ai = new GoogleGenAI({});
+const History = [];
 
-const textSplitter = new RecursiveCharacterTextSplitter({
-    chunkSize: 1000,
-    chunkOverlap: 200,
+async function transformQuery(question) {
+  History.push({
+    role: 'user',
+    parts: [{ text: question }]
   });
-const chunkedDocs = await textSplitter.splitDocuments(rawDocs);
-console.log("Chunking Completed");
 
-// vector Embedding model
+  const response = await ai.models.generateContent({
+    model: "gemini-2.0-flash",
+    contents: History,
+    config: {
+      systemInstruction: `You are a query rewriting expert. Based on the chat history, rephrase the "Follow Up user Question" into a complete, standalone question.
+Only output the rewritten question and nothing else.`
+    }
+  });
 
- const embeddings = new GoogleGenerativeAIEmbeddings({
+  History.pop();
+  return response.text;
+}
+
+async function chatting(question) {
+  const queries = await transformQuery(question);
+
+  const embeddings = new GoogleGenerativeAIEmbeddings({
     apiKey: process.env.GEMINI_API_KEY,
     model: 'text-embedding-004',
   });
 
-  console.log("Embedding model configured")
+  const queryVector = await embeddings.embedQuery(queries);
 
+  const pinecone = new Pinecone();
+  const pineconeIndex = pinecone.Index(process.env.PINECONE_INDEX_NAME);
 
-//   Database ko bhi configure
-//  Initialize Pinecone Client
+  const searchResults = await pineconeIndex.query({
+    topK: 10,
+    vector: queryVector,
+    includeMetadata: true,
+  });
 
-const pinecone = new Pinecone();
-const pineconeIndex = pinecone.Index(process.env.PINECONE_INDEX_NAME);
- console.log("Pinecone configured")
+  const context = searchResults.matches
+    .map(match => match.metadata.text)
+    .join("\n\n---\n\n");
 
-// langchain (chunking,embedding,database)
+  History.push({
+    role: 'user',
+    parts: [{ text: queries }]
+  });
 
-await PineconeStore.fromDocuments(chunkedDocs, embeddings, {
-    pineconeIndex,
-    maxConcurrency: 5,
-});
+  const response = await ai.models.generateContent({
+    model: "gemini-2.0-flash",
+    contents: History,
+    config: {
+      systemInstruction: `You are an insurance advisor specialized in explaining health insurance policies clearly.
+Use the context below to answer the user's question.
+If not found in the context, say: "I could not find the answer in the provided document."
 
- console.log("Data Stored succesfully")
+Context: ${context}`
+    }
+  });
 
+  History.push({
+    role: 'model',
+    parts: [{ text: response.text }]
+  });
 
+  return response.text;
 }
 
-indexDocument();
+// API Endpoint for /hackrx/run
+app.post('/hackrx/run', async (req, res) => {
+  const { question } = req.body;
+
+  if (!question) {
+    return res.status(400).json({ error: "Missing 'question' field in request body." });
+  }
+
+  try {
+    const answer = await chatting(question);
+    return res.json({ answer });
+  } catch (err) {
+    console.error("Error in /hackrx/run:", err);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+app.get('/', (req, res) => {
+  res.send("🚀 HackRx Insurance Agent API is live.");
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
+});
