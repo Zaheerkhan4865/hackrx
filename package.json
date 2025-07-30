@@ -29,7 +29,5 @@
   },
   "keywords": []
 }
-"scripts": {
-  "start": "node index.js"
-}
+
 
