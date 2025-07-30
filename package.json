@@ -1,0 +1,31 @@
+{
+  "type": "module",
+  "name": "langchain-pinecone-genai",
+  "version": "0.1.0",
+  "description": "A LangChain application that indexes PDF documents into Pinecone and allows querying with Google GenAI.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "Rohit Neogi",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": "^18.0.0"
+  },
+  "dependencies": {
+    "@google/genai": "^1.11.0",
+    "@langchain/community": "^0.3.49",
+    "@langchain/core": "^0.3.66",
+    "@langchain/google-genai": "^0.2.16",
+    "@langchain/pinecone": "^0.2.0",
+    "@langchain/textsplitters": "^0.1.0",
+    "@pinecone-database/pinecone": "^5.1.2",
+    "dotenv": "^16.4.5",
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "pdf-parse": "^1.1.1",
+    "readline-sync": "^1.4.10"
+  },
+  "keywords": []
+}
