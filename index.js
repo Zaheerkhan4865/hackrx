@@ -1,9 +1,8 @@
 import express from 'express';
-import dotenv from 'dotenv';
-import fetch from 'node-fetch';
+import axios from 'axios';
+import * as dotenv from 'dotenv';
 import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { v4 as uuidv4 } from 'uuid';
 import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { GoogleGenerativeAIEmbeddings } from '@langchain/google-genai';
@@ -13,92 +12,97 @@ import { GoogleGenAI } from '@google/genai';
 
 dotenv.config();
 const app = express();
-const PORT = process.env.PORT || 3000;
 app.use(express.json());
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const PORT = 8000;
+const ai = new GoogleGenAI({});
+const TEAM_TOKEN = "185e9c4657f138c2ed3e69c3a85da7d3ae371a2ca037dc5ab517d544f3256ec0";
 
 app.post('/hackrx/run', async (req, res) => {
   try {
-    const { documents, questions } = req.body;
-    if (!documents || !questions) {
-      return res.status(400).json({ error: 'Missing documents or questions' });
+    // Token Validation
+    const auth = req.headers.authorization;
+    if (!auth || auth !== `Bearer ${TEAM_TOKEN}`) {
+      return res.status(401).json({ error: "Unauthorized" });
     }
 
-    // Step 1: Download PDF from URL
-    const pdfPath = path.join(__dirname, 'temp.pdf');
-    const fileResponse = await fetch(documents);
-    const fileStream = fs.createWriteStream(pdfPath);
+    const { documents, questions } = req.body;
+    if (!documents || !Array.isArray(questions)) {
+      return res.status(400).json({ error: "Missing documents or questions array" });
+    }
+
+    // Download PDF
+    const tempFilePath = `./temp-${uuidv4()}.pdf`;
+    const response = await axios.get(documents, { responseType: 'stream' });
+    const writer = fs.createWriteStream(tempFilePath);
     await new Promise((resolve, reject) => {
-      fileResponse.body.pipe(fileStream);
-      fileResponse.body.on('error', reject);
-      fileStream.on('finish', resolve);
+      response.data.pipe(writer);
+      writer.on('finish', resolve);
+      writer.on('error', reject);
     });
 
-    // Step 2: Load and chunk the document
-    const loader = new PDFLoader(pdfPath);
-    const rawDocs = await loader.load();
-    const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 1000, chunkOverlap: 200 });
-    const docs = await splitter.splitDocuments(rawDocs);
+    // Load + Split + Embed + Store
+    const pdfLoader = new PDFLoader(tempFilePath);
+    const rawDocs = await pdfLoader.load();
 
-    // Step 3: Embed and store vectors in Pinecone
+    const splitter = new RecursiveCharacterTextSplitter({
+      chunkSize: 1000,
+      chunkOverlap: 200,
+    });
+    const chunkedDocs = await splitter.splitDocuments(rawDocs);
+
     const embeddings = new GoogleGenerativeAIEmbeddings({
       apiKey: process.env.GEMINI_API_KEY,
       model: 'text-embedding-004',
     });
 
     const pinecone = new Pinecone();
-    const index = pinecone.Index(process.env.PINECONE_INDEX_NAME);
-    await PineconeStore.fromDocuments(docs, embeddings, {
-      pineconeIndex: index,
+    const pineconeIndex = pinecone.Index(process.env.PINECONE_INDEX_NAME);
+
+    await PineconeStore.fromDocuments(chunkedDocs, embeddings, {
+      pineconeIndex,
       maxConcurrency: 5,
     });
 
-    // Step 4: Answer each question
-    const responseData = {};
+    fs.unlinkSync(tempFilePath); // Cleanup
 
-    for (const question of questions) {
-      const vector = await embeddings.embedQuery(question);
-      const results = await index.query({
-        vector,
+    // Answer each question
+    const answers = [];
+    for (let question of questions) {
+      const queryVector = await embeddings.embedQuery(question);
+      const results = await pineconeIndex.query({
         topK: 10,
+        vector: queryVector,
         includeMetadata: true,
       });
 
       const context = results.matches
-        .map(match => match.metadata.text)
+        .map(m => m.metadata.text)
         .join('\n\n---\n\n');
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.0-pro',
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: `Context:\n${context}\n\nQuestion:\n${question}` }],
-          },
-        ],
+      const geminiResponse = await ai.models.generateContent({
+        model: "gemini-2.0-flash",
+        contents: [{ role: "user", parts: [{ text: question }] }],
         config: {
-          systemInstruction: `You are an insurance advisor answering only using the given context. If the answer is not in the document, reply: "I could not find the answer in the provided document."`,
+          systemInstruction: `You are an insurance advisor specialized in health insurance policies.
+Answer using only this context. If not found, reply: "I could not find the answer in the provided document."
+
+Context:
+${context}
+          `,
         },
       });
 
-      responseData[question] = response.text;
+      answers.push(geminiResponse.text || "I could not find the answer in the provided document.");
     }
 
-    res.status(200).json({ answers: responseData });
-  } catch (err) {
-    console.error('Error in /hackrx/run:', err);
-    res.status(500).json({ error: 'Internal Server Error' });
+    res.json({ answers });
+  } catch (error) {
+    console.error("❌ Error:", error);
+    res.status(500).json({ error: "Something went wrong" });
   }
 });
 
-app.get('/', (req, res) => {
-  res.send('Health Insurance QA API is running!');
-});
-
 app.listen(PORT, () => {
-  console.log(`✅ Server running on http://localhost:${PORT}`);
+  console.log(`🚀 API running at http://localhost:${PORT}/hackrx/run`);
 });
