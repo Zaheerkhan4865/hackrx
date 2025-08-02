@@ -2,104 +2,160 @@ import express from 'express';
 import axios from 'axios';
 import * as dotenv from 'dotenv';
 import fs from 'fs';
+import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { GoogleGenerativeAIEmbeddings } from '@langchain/google-genai';
 import { Pinecone } from '@pinecone-database/pinecone';
 import { PineconeStore } from '@langchain/pinecone';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 dotenv.config();
 const app = express();
 app.use(express.json());
 
 const PORT = 8000;
-const ai = new GoogleGenAI({});
-const TEAM_TOKEN = "185e9c4657f138c2ed3e69c3a85da7d3ae371a2ca037dc5ab517d544f3256ec0";
+const TEAM_TOKEN = process.env.TEAM_TOKEN;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const PINECONE_INDEX_NAME = process.env.PINECONE_INDEX_NAME;
 
-app.post('/hackrx/run', async (req, res) => {
-  try {
-    // Token Validation
-    const auth = req.headers.authorization;
-    if (!auth || auth !== `Bearer ${TEAM_TOKEN}`) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
+const ai = new GoogleGenerativeAI(GEMINI_API_KEY);
+const processedDocs = new Set(); // in-memory cache
 
-    const { documents, questions } = req.body;
-    if (!documents || !Array.isArray(questions)) {
-      return res.status(400).json({ error: "Missing documents or questions array" });
-    }
+// Create SHA256 hash of document URL
+function hashURL(url) {
+  return crypto.createHash('sha256').update(url).digest('hex');
+}
 
-    // Download PDF
-    const tempFilePath = `./temp-${uuidv4()}.pdf`;
-    const response = await axios.get(documents, { responseType: 'stream' });
-    const writer = fs.createWriteStream(tempFilePath);
-    await new Promise((resolve, reject) => {
-      response.data.pipe(writer);
-      writer.on('finish', resolve);
-      writer.on('error', reject);
-    });
+// Process and embed PDF to Pinecone
+async function processPDF(url, localPath) {
+  const response = await axios.get(url, { responseType: 'stream' });
+  const writer = fs.createWriteStream(localPath);
 
-    // Load + Split + Embed + Store
-    const pdfLoader = new PDFLoader(tempFilePath);
-    const rawDocs = await pdfLoader.load();
+  await new Promise((resolve, reject) => {
+    response.data.pipe(writer);
+    writer.on('finish', resolve);
+    writer.on('error', reject);
+  });
 
-    const splitter = new RecursiveCharacterTextSplitter({
-      chunkSize: 1000,
-      chunkOverlap: 200,
-    });
-    const chunkedDocs = await splitter.splitDocuments(rawDocs);
+  const loader = new PDFLoader(localPath);
+  const rawDocs = await loader.load();
 
-    const embeddings = new GoogleGenerativeAIEmbeddings({
-      apiKey: process.env.GEMINI_API_KEY,
-      model: 'text-embedding-004',
-    });
+  const splitter = new RecursiveCharacterTextSplitter({
+    chunkSize: 800,
+    chunkOverlap: 100,
+  });
+  const chunks = await splitter.splitDocuments(rawDocs);
 
-    const pinecone = new Pinecone();
-    const pineconeIndex = pinecone.Index(process.env.PINECONE_INDEX_NAME);
+  const embeddings = new GoogleGenerativeAIEmbeddings({
+    apiKey: GEMINI_API_KEY,
+    model: 'text-embedding-004',
+  });
 
-    await PineconeStore.fromDocuments(chunkedDocs, embeddings, {
-      pineconeIndex,
-      maxConcurrency: 5,
-    });
+  const pinecone = new Pinecone();
+  const pineconeIndex = pinecone.Index(PINECONE_INDEX_NAME);
 
-    fs.unlinkSync(tempFilePath); // Cleanup
+  await PineconeStore.fromDocuments(chunks, embeddings, {
+    pineconeIndex,
+    maxConcurrency: 5,
+  });
 
-    // Answer each question
-    const answers = [];
-    for (let question of questions) {
-      const queryVector = await embeddings.embedQuery(question);
-      const results = await pineconeIndex.query({
+  fs.unlinkSync(localPath);
+}
+
+// Retry wrapper for Pinecone query
+async function queryWithRetry(pineconeIndex, queryVector, retries = 2) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await pineconeIndex.query({
         topK: 10,
         vector: queryVector,
         includeMetadata: true,
       });
+    } catch (e) {
+      if (attempt === retries) throw e;
+      console.warn(`🔁 Retry ${attempt} failed. Retrying...`);
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+}
 
-      const context = results.matches
-        .map(m => m.metadata.text)
-        .join('\n\n---\n\n');
+// Answer a question using Gemini + Pinecone context
+async function answerQuestion(question, embeddings, pineconeIndex) {
+  try {
+    const queryVector = await embeddings.embedQuery(question);
+    const results = await queryWithRetry(pineconeIndex, queryVector);
 
-      const geminiResponse = await ai.models.generateContent({
-        model: "gemini-2.0-flash",
-        contents: [{ role: "user", parts: [{ text: question }] }],
-        config: {
-          systemInstruction: `You are an insurance advisor specialized in health insurance policies.
-Answer using only this context. If not found, reply: "I could not find the answer in the provided document."
+    const context = results.matches
+      .map((m) => m.metadata.text)
+      .join('\n\n---\n\n');
+
+    const prompt = `
+You are an expert insurance advisor.
+
+Using ONLY the context provided below, answer the user's question plainly.
+
+If the answer is not found in the context, reply exactly:
+"I could not find the answer in the provided document."
+
+Question: ${question}
 
 Context:
 ${context}
-          `,
-        },
-      });
+    `.trim();
 
-      answers.push(geminiResponse.text || "I could not find the answer in the provided document.");
+    const model = ai.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    return response.text().trim();
+  } catch (error) {
+    console.error(`❌ Gemini error for "${question}":`, error.message || error);
+    return "An error occurred while processing this question.";
+  }
+}
+
+// Main API route
+app.post('/hackrx/run', async (req, res) => {
+  try {
+    const auth = req.headers.authorization;
+    if (!auth || auth !== `Bearer ${TEAM_TOKEN}`) {
+      return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const { documents, questions } = req.body;
+    if (!documents || !Array.isArray(questions)) {
+      return res.status(400).json({ error: 'Missing "documents" or "questions"' });
+    }
+
+    const hash = hashURL(documents);
+    const localPath = `./temp-${uuidv4()}.pdf`;
+
+    const embeddings = new GoogleGenerativeAIEmbeddings({
+      apiKey: GEMINI_API_KEY,
+      model: 'text-embedding-004',
+    });
+
+    const pinecone = new Pinecone();
+    const pineconeIndex = pinecone.Index(PINECONE_INDEX_NAME);
+
+    if (!processedDocs.has(hash)) {
+      console.log("📄 Processing new document...");
+      await processPDF(documents, localPath);
+      processedDocs.add(hash);
+      console.log("✅ PDF processed and indexed.");
+    } else {
+      console.log("⏩ Using cached document.");
+    }
+
+    const answers = await Promise.all(
+      questions.map((q) => answerQuestion(q, embeddings, pineconeIndex))
+    );
+
     res.json({ answers });
-  } catch (error) {
-    console.error("❌ Error:", error);
-    res.status(500).json({ error: "Something went wrong" });
+  } catch (err) {
+    console.error('❌ API error:', err.message || err);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
