@@ -82,27 +82,29 @@ async function queryWithRetry(pineconeIndex, queryVector, retries = 2) {
 }
 
 // Answer a question using Gemini + Pinecone context
+// Answer a question using Gemini + Pinecone context with proof
 async function answerQuestion(question, embeddings, pineconeIndex) {
   try {
     const queryVector = await embeddings.embedQuery(question);
     const results = await queryWithRetry(pineconeIndex, queryVector);
 
-    const context = results.matches
-      .map((m) => m.metadata.text)
-      .join('\n\n---\n\n');
+    const contextChunks = results.matches.map((m, idx) => `Source ${idx + 1}:\n${m.metadata.text}`).join('\n\n---\n\n');
 
     const prompt = `
-You are an expert insurance advisor.
+You are an intelligent and reliable assistant.
 
-Using ONLY the context provided below, answer the user's question plainly.
+Use ONLY the context provided below to answer the user's question clearly and accurately.
 
-If the answer is not found in the context, reply exactly:
+Your response must:
+- Answer the question based on the content.
+- Include very small references or quotes from the context as evidence ("proof").
+- If the answer cannot be found in the context, reply exactly:
 "I could not find the answer in the provided document."
 
 Question: ${question}
 
 Context:
-${context}
+${contextChunks}
     `.trim();
 
     const model = ai.getGenerativeModel({ model: 'gemini-1.5-flash' });
@@ -114,6 +116,7 @@ ${context}
     return "An error occurred while processing this question.";
   }
 }
+
 
 // Main API route
 app.post('/hackrx/run', async (req, res) => {
