@@ -107,7 +107,7 @@ Context:
 ${contextChunks}
     `.trim();
 
-    const model = ai.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    const model = ai.getGenerativeModel({ model: 'gemini-1.5-pro' });
     const result = await model.generateContent(prompt);
     const response = await result.response;
     return response.text().trim();
@@ -165,3 +165,4 @@ app.post('/hackrx/run', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 API running at http://localhost:${PORT}/hackrx/run`);
 });
+
