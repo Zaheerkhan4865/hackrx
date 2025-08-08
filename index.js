@@ -2,9 +2,11 @@ import express from 'express';
 import axios from 'axios';
 import * as dotenv from 'dotenv';
 import fs from 'fs';
+import path from 'path';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf';
+import { DocxLoader } from '@langchain/community/document_loaders/fs/docx';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { GoogleGenerativeAIEmbeddings } from '@langchain/google-genai';
 import { Pinecone } from '@pinecone-database/pinecone';
@@ -28,31 +30,49 @@ function hashURL(url) {
   return crypto.createHash('sha256').update(url).digest('hex');
 }
 
-// Process and embed PDF to Pinecone
-async function processPDF(url, localPath) {
+// Generic document processor for PDF/DOCX
+async function processDocument(url) {
+  // Detect file extension
+  let ext = path.extname(new URL(url).pathname).toLowerCase();
+  if (!['.pdf', '.docx'].includes(ext)) {
+    throw new Error('Unsupported document format. Only PDF and DOCX are allowed.');
+  }
+
+  const localPath = `./temp-${uuidv4()}${ext}`;
+
+  // Download file
   const response = await axios.get(url, { responseType: 'stream' });
   const writer = fs.createWriteStream(localPath);
-
   await new Promise((resolve, reject) => {
     response.data.pipe(writer);
     writer.on('finish', resolve);
     writer.on('error', reject);
   });
 
-  const loader = new PDFLoader(localPath);
+  // Pick correct loader
+  let loader;
+  if (ext === '.pdf') {
+    loader = new PDFLoader(localPath);
+  } else if (ext === '.docx') {
+    loader = new DocxLoader(localPath);
+  }
+
   const rawDocs = await loader.load();
 
+  // Split into chunks
   const splitter = new RecursiveCharacterTextSplitter({
     chunkSize: 800,
     chunkOverlap: 100,
   });
   const chunks = await splitter.splitDocuments(rawDocs);
 
+  // Generate embeddings
   const embeddings = new GoogleGenerativeAIEmbeddings({
     apiKey: GEMINI_API_KEY,
     model: 'text-embedding-004',
   });
 
+  // Store in Pinecone
   const pinecone = new Pinecone();
   const pineconeIndex = pinecone.Index(PINECONE_INDEX_NAME);
 
@@ -61,6 +81,7 @@ async function processPDF(url, localPath) {
     maxConcurrency: 5,
   });
 
+  // Clean up
   fs.unlinkSync(localPath);
 }
 
@@ -81,33 +102,47 @@ async function queryWithRetry(pineconeIndex, queryVector, retries = 2) {
   }
 }
 
-// Answer a question using Gemini + Pinecone context
-// Answer a question using Gemini + Pinecone context with proof
+// Answer question using Gemini + Pinecone with proof
 async function answerQuestion(question, embeddings, pineconeIndex) {
   try {
     const queryVector = await embeddings.embedQuery(question);
     const results = await queryWithRetry(pineconeIndex, queryVector);
 
-    const contextChunks = results.matches.map((m, idx) => `Source ${idx + 1}:\n${m.metadata.text}`).join('\n\n---\n\n');
+    const contextChunks = results.matches
+      .map((m, idx) => `Source ${idx + 1}:\n${m.metadata.text}`)
+      .join('\n\n---\n\n');
 
     const prompt = `
-You are an intelligent and reliable assistant.
+You are an expert insurance policy analyst. Provide concise yet comprehensive answers with maximum numerical precision.
 
-Use ONLY the context provided below to answer the user's question clearly and accurately.
+CRITICAL REQUIREMENTS:
+- For yes/no questions: Start with "Yes," or "No," then provide essential explanation
+- Include ALL key numbers: exact days, months, years, percentages, amounts
+- State important plan variations (Plan A vs Plan B vs Plan C) with key differences only
+- Include essential age limits, waiting periods, and main coverage conditions
+- Quote main benefit amounts, caps, and limits with numbers
+- Mention only critical exceptions and key conditions
+- Keep responses concise-medium length (50 words max) but include all essential details
+You are an expert insurance claims evaluator. Based on the provided context from policy documents, evaluate the insurance claim and make a decision.
 
-Your response must:
-- Answer the question based on the content.
-- Include very small references or quotes from the context as evidence ("proof").
-- If the answer cannot be found in the context, reply exactly:
-"I could not find the answer in the provided document."
+Original Query: {input}
+Parsed Information: {parsedInfo}
 
+Context from Policy Documents:
+{context}
+
+Instructions:
+1. Analyze the query against the provided policy context
+2. Make a clear decision: "Approved" or "Rejected"
+3. If approved, determine the coverage amount (use null if not specified)
+4. Provide detailed justification referencing specific clauses or sections
 Question: ${question}
 
 Context:
 ${contextChunks}
     `.trim();
 
-    const model = ai.getGenerativeModel({ model: 'gemini-1.5-pro' });
+    const model = ai.getGenerativeModel({ model: 'gemini-2.5-pro' });
     const result = await model.generateContent(prompt);
     const response = await result.response;
     return response.text().trim();
@@ -116,7 +151,6 @@ ${contextChunks}
     return "An error occurred while processing this question.";
   }
 }
-
 
 // Main API route
 app.post('/hackrx/run', async (req, res) => {
@@ -132,7 +166,6 @@ app.post('/hackrx/run', async (req, res) => {
     }
 
     const hash = hashURL(documents);
-    const localPath = `./temp-${uuidv4()}.pdf`;
 
     const embeddings = new GoogleGenerativeAIEmbeddings({
       apiKey: GEMINI_API_KEY,
@@ -144,9 +177,9 @@ app.post('/hackrx/run', async (req, res) => {
 
     if (!processedDocs.has(hash)) {
       console.log("📄 Processing new document...");
-      await processPDF(documents, localPath);
+      await processDocument(documents);
       processedDocs.add(hash);
-      console.log("✅ PDF processed and indexed.");
+      console.log("✅ Document processed and indexed.");
     } else {
       console.log("⏩ Using cached document.");
     }
@@ -165,4 +198,3 @@ app.post('/hackrx/run', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 API running at http://localhost:${PORT}/hackrx/run`);
 });
-
